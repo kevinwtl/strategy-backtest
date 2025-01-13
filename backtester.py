@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from datetime import datetime
 from functools import cache, cached_property
 from typing import Literal
@@ -82,6 +83,8 @@ class BacktestTemplate(ABC):
             df = self._zscore_model_backtest()
         elif self.backtest_model == "signal":
             df = self._signal_model_backtest()
+        else:
+            raise ValueError(f"Invalid backtest model: {self.backtest_model}")
 
         df["holding period"] = df["exit_time"] - df["entry_time"]
         return df
@@ -373,32 +376,52 @@ class BacktestTemplate(ABC):
         result_df = self.run_backtest()
         result_df["pct_ret"].hist(bins=100)
 
-    def sharpe_ratio(self):
+    def sharpe_ratio(self, start_date: datetime = None, end_date: datetime = None):
         rets = self._unrealized_equity_curve().resample(self.sharpe_freq).last().ffill().pct_change()
+        if start_date:
+            rets = rets[start_date:]
+        if end_date:
+            rets = rets[:end_date]
         n_per_peroid = {"1d": 365, "1h": 8760}[self.sharpe_freq]
         avg_ret = rets.mean() * n_per_peroid
         std = rets.std() * n_per_peroid**0.5
         return avg_ret / std
 
-    def mdd(self):
+    def mdd(self, start_date: datetime = None, end_date: datetime = None):
         equity_curve = self._unrealized_equity_curve()
+        if start_date:
+            equity_curve = equity_curve[start_date:]
+        if end_date:
+            equity_curve = equity_curve[:end_date]
         cum_max = equity_curve.cummax()
         roll_drawdown = equity_curve / cum_max - 1
         mdd = -roll_drawdown.min()
         return mdd
 
-    def calmar_ratio(self):
+    def calmar_ratio(self, start_date: datetime = None, end_date: datetime = None):
         rets = self._unrealized_equity_curve().resample("1d").last().ffill().pct_change()
+        if start_date:
+            rets = rets[start_date:]
+        if end_date:
+            rets = rets[:end_date]
         avg_ret = rets.mean() * 365
-        return avg_ret / self.mdd()
+        return avg_ret / self.mdd(start_date, end_date)
 
-    def annualized_return(self):
+    def annualized_return(self, start_date: datetime = None, end_date: datetime = None):
         equity_curve = self._unrealized_equity_curve().resample("1d").last().ffill()
+        if start_date:
+            equity_curve = equity_curve[start_date:]
+        if end_date:
+            equity_curve = equity_curve[:end_date]
         n_years = (equity_curve.index.max() - equity_curve.index.min()).days / 365
         return (equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (1 / n_years) - 1
 
-    def avg_trades_per_week(self):
+    def avg_trades_per_week(self, start_date: datetime = None, end_date: datetime = None):
         result_df = self.run_backtest().copy()
+        if start_date:
+            result_df = result_df[start_date:]
+        if end_date:
+            result_df = result_df[:end_date]
         if len(result_df) == 0:
             raise ValueError("No trades executed")
         days = (result_df["entry_time"].max() - result_df["entry_time"].min()).days
@@ -466,7 +489,72 @@ class BacktestTemplate(ABC):
         grid = gridplot([[p1], [p2], [p3]])
         show(grid)
 
-    def optimize(self, param_grid: dict, workers: int = 8):
+    def get_param_result(self, kfold: int = 1, **kwargs) -> dict:
+
+        self = deepcopy(self)
+        self.set_param(**kwargs)
+        trades = self.run_backtest()
+        results = []
+
+        # Run the first set without partitioning
+        try:
+            metrics = {
+                "sharpe": self.sharpe_ratio(),
+                "mdd": self.mdd(),
+                "calmar": self.calmar_ratio(),
+                "final_bal": trades["balance"].iloc[-1] / trades["balance"].iloc[0] * 100,
+                "n_trades": len(trades),
+                "hit_rate": len(trades[trades["net_profit"] > 0]) / len(trades),
+                "long_hit_rate": len(trades.query("qty > 0 and net_profit > 0")) / max(1, len(trades.query("qty > 0"))),
+                "short_hit_rate": len(trades.query("qty < 0 and net_profit > 0")) / max(1, len(trades.query("qty < 0"))),
+                "avg_hold_period": trades["holding period"].mean(),
+                "kfold": 0,
+                "start_date": None,
+                "end_date": None,
+            }
+
+            results.append({**kwargs, **metrics})
+
+        except Exception as e:
+            print(f"Error with parameters {kwargs}: {str(e)}")
+            return None
+
+        # Run the rest with partitioning
+        if kfold > 1:
+            trades_copy = trades.copy()
+            for i in range(kfold):
+                equity_curve = self._unrealized_equity_curve()
+                split_size = equity_curve.shape[0] // kfold
+                start_date = equity_curve.index[i * split_size]
+                end_date = equity_curve.index[min((i + 1) * split_size, equity_curve.shape[0] - 1)]
+                trades = trades_copy.query("entry_time >= @start_date and entry_time <= @end_date")
+
+                try:
+                    # Calculate performance metrics
+                    metrics = {
+                        "sharpe": self.sharpe_ratio(start_date, end_date),
+                        "mdd": self.mdd(start_date, end_date),
+                        "calmar": self.calmar_ratio(start_date, end_date),
+                        "final_bal": trades["balance"].iloc[-1] / trades["balance"].iloc[0] * 100,
+                        "n_trades": len(trades),
+                        "hit_rate": len(trades[trades["net_profit"] > 0]) / len(trades),
+                        "long_hit_rate": len(trades.query("qty > 0 and net_profit > 0")) / max(1, len(trades.query("qty > 0"))),
+                        "short_hit_rate": len(trades.query("qty < 0 and net_profit > 0")) / max(1, len(trades.query("qty < 0"))),
+                        "avg_hold_period": trades["holding period"].mean(),
+                        "kfold": i+1,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                    }
+
+                    results.append({**kwargs, **metrics})
+
+                except Exception as e:
+                    print(f"Error with parameters {kwargs}: {str(e)}")
+                    return None
+
+        return results
+
+    def optimize(self, param_grid: dict, kfold: int = 1, workers: int = 4):
         """
         Optimize strategy parameters by testing different combinations.
 
@@ -476,46 +564,31 @@ class BacktestTemplate(ABC):
         Returns:
             List of dictionaries containing results for each parameter combination
         """
-
-
         # Convert param_grid to list of parameter combinations if needed
         if isinstance(param_grid, dict):
             import itertools
-
             keys = param_grid.keys()
             values = param_grid.values()
             param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
 
-        def get_metrics(params):
-            try:
-                # Run backtest with current parameters
-                self.set_param(**params)
-                result = self.run_backtest()
-
-                # Calculate performance metrics
-                metrics = {
-                    "sharpe": self.sharpe_ratio(),
-                    "mdd": self.mdd(),
-                    "calmar": self.calmar_ratio(),
-                    "final_bal": result["balance"].iloc[-1],
-                    "n_trades": len(result),
-                    "hit_rate": len(result[result["net_profit"] > 0]) / len(result),
-                    "long_hit_rate": len(result.query("qty > 0 and net_profit > 0")) / max(1, len(result.query("qty > 0"))),
-                    "short_hit_rate": len(result.query("qty < 0 and net_profit > 0")) / max(1, len(result.query("qty < 0"))),
-                    "avg_hold_period": result["holding period"].mean(),
-                }
-
-                return {**params, **metrics}
-
-            except Exception as e:
-                print(f"Error with parameters {params}: {str(e)}")
-                return None
-
         results = []
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(get_metrics, params) for params in param_combinations]
+            futures = []
+            for params in param_combinations:
+                futures.append(
+                    executor.submit(
+                        self.get_param_result,
+                        kfold=kfold,
+                        **params
+                    )
+                )
+
             for future in tqdm(as_completed(futures), total=len(futures)):
-                if (result := future.result()) is not None:
-                    results.append(result)
+                try:
+                    if (result := future.result()) is not None:
+                        results.extend(result)
+                except Exception as e:
+                    pass
 
         return pd.DataFrame(results)
